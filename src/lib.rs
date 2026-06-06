@@ -48,7 +48,7 @@ impl LeaseGrid {
     }
 
     pub fn get(&self, x: usize, y: usize) -> CellState {
-        if x >= self.width || y >= self.height { return CellState::Free; }
+        if x >= self.width || y >= self.height { return CellState::Leased; } // out of bounds = not free
         self.cells[self.idx(x, y)]
     }
 
@@ -79,10 +79,11 @@ impl LeaseGrid {
         None
     }
 
-    /// Fragmentation: 1 - (largest_free_block / total_free)
+    /// Fragmentation: 0 when all free or none free. Higher when free cells are scattered.
     pub fn fragmentation(&self) -> f64 {
         let total_free: usize = self.cells.iter().filter(|&&c| c == CellState::Free).count();
         if total_free == 0 { return 0.0; }
+        if total_free == self.cells.len() { return 0.0; } // all free = no fragmentation
         // Simple largest contiguous free row
         let mut max_run = 0usize;
         for y in 0..self.height {
