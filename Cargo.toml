@@ -1,0 +1,7 @@
+[package]
+name = "oxide-lease-grid"
+version = "0.1.0"
+edition = "2021"
+description = "Grid-based lease matrix for multi-GPU resource allocation with ternary cell states. {+1=leased, 0=reserved, -1=free}. 2D allocation, compaction, heatmap."
+license = "Apache-2.0"
+repository = "https://github.com/SuperInstance/oxide-lease-grid"
