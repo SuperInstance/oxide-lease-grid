@@ -1,86 +1,120 @@
 # oxide-lease-grid
 
-Grid-based lease matrix for multi-GPU resource allocation with ternary cell states. {+1=leased, 0=reserved, -1=free}. 2D allocation, compaction, heatmap.
+Grid-based lease matrix for multi-GPU spatial resource allocation.
 
-## Overview
+## Why This Exists
 
-# oxide-lease-grid
+GPU resources aren't just scalar quantities you can divide with percentages. On a multi-GPU system, allocation is spatial: which GPU, which memory region, which compute unit. A "lease" is a claim on a specific cell in a resource grid. The grid models the spatial nature of GPU allocation — you can't lease the same SM to two kernels simultaneously, and you need contiguous blocks for some operations.
 
-Grid-based lease matrix for multi-GPU resource allocation.
+The ternary cell model captures the lifecycle: **Free** (-1, available), **Reserved** (0, claimed but not active), **Leased** (+1, actively in use). This three-state model handles the common pattern where a kernel reserves resources during compilation but doesn't activate them until dispatch. It also prevents double-allocation without locks — a cell transitions atomically from Free to Reserved or Leased.
 
 ## Architecture
 
-This crate sits within the **five-layer Oxide Stack**:
-
-| Layer | Crate | Role |
-|-------|-------|------|
-| 1 | open-parallel | Async runtime (tokio fork) |
-| 2 | pincher | "Vector DB as runtime, LLM as compiler" |
-| 3 | flux-core | Bytecode VM + A2A agent protocol |
-| 4 | cuda-oxide | Flux→MIR→Pliron→NVVM→PTX compiler |
-| 5 | cudaclaw | Persistent GPU kernels, warp consensus, SmartCRDT |
-
-The key insight: **ternary values {-1, 0, +1} map directly to GPU compute**. They pack 16× denser than FP32, enable XNOR+popcount matmul, and conservation laws become compile-time checks.
-
-## Stats
-
-| Metric | Value |
-|--------|-------|
-| Tests | 8 |
-| Lines of Code | 177 |
-| Public API Surface | 16 items |
-| License | Apache-2.0 |
-
-## Installation
-
-```toml
-[dependencies]
-oxide-lease-grid = "0.1.0"
 ```
+┌─────────────────────────────────────────────┐
+│          LeaseGrid (8×8 example)            │
+│                                             │
+│    0   1   2   3   4   5   6   7           │
+│  ┌───┬───┬───┬───┬───┬───┬───┬───┐        │
+│0 │ L │ L │ L │ F │ F │ F │ F │ F │        │
+│  ├───┼───┼───┼───┼───┼───┼───┼───┤        │
+│1 │ L │ L │ L │ F │ F │ R │ R │ F │        │
+│  ├───┼───┼───┼───┼───┼───┼───┼───┤        │
+│2 │ F │ F │ F │ F │ F │ R │ R │ F │        │
+│  ├───┼───┼───┼───┼───┼───┼───┼───┤        │
+│3 │ F │ F │ F │ F │ F │ F │ F │ F │        │
+│  └───┴───┴───┴───┴───┴───┴───┴───┘        │
+│                                             │
+│  L = Leased (kernel_a, 3×2 block at 0,0)   │
+│  R = Reserved (kernel_b, 2×2 block at 1,5) │
+│  F = Free                                   │
+│                                             │
+│  allocate_block(w, h, owner) → (x, y)       │
+│  fragmentation() → f64                      │
+│  utilization() → f64                        │
+└─────────────────────────────────────────────┘
+
+Block Allocation (first-fit):
+  Scan row by row, find first contiguous w×h free block
+  Convert all cells to Leased with owner tag
+
+Fragmentation Metric:
+  1.0 - (longest free row run / total free cells)
+  0.0 = all free or no free cells (unfragmented extremes)
+  →1.0 = free cells scattered in small runs (fragmented)
+```
+
+**Key types:**
+
+- `CellState` — `Leased(+1)`, `Reserved(0)`, `Free(-1)`
+- `LeaseGrid` — width × height matrix of cells with owner tracking
 
 ## Usage
 
 ```rust
-use oxide_lease_grid::*;
-// See src/lib.rs tests for complete working examples
+use oxide_lease_grid::LeaseGrid;
+
+let mut grid = LeaseGrid::new(8, 8); // 8×8 resource grid
+
+// Allocate a 3×2 block for a kernel
+let pos = grid.allocate_block(3, 2, "conv2d_kernel");
+assert_eq!(pos, Some((0, 0))); // top-left corner
+assert_eq!(grid.leased_count(), 6); // 3 × 2 = 6 cells
+
+// Reserve a 2×2 block (claimed but not active)
+grid.reserve(5, 1, "matmul_kernel");
+grid.reserve(5, 2, "matmul_kernel");
+grid.reserve(6, 1, "matmul_kernel");
+grid.reserve(6, 2, "matmul_kernel");
+
+// Check utilization and fragmentation
+println!("Utilization: {:.1}%", grid.utilization() * 100.0);
+println!("Fragmentation: {:.2}", grid.fragmentation());
+
+// Release cells when done
+grid.release(0, 0); // release single cell
+assert_eq!(grid.owner(0, 0), None);
+
+// Check counts
+println!("Leased: {}, Reserved: {}, Free: {}",
+    grid.leased_count(), grid.reserved_count(), grid.free_count());
 ```
 
-### Key Types
+## API Reference
 
-```
-- pub enum CellState { Leased = 1, Reserved = 0, Free = -1 }
-- pub struct LeaseGrid {
-    pub fn new(width: usize, height: usize) -> Self {
-    pub fn lease(&mut self, x: usize, y: usize, owner: &str) -> bool {
-    pub fn reserve(&mut self, x: usize, y: usize, owner: &str) -> bool {
-    pub fn release(&mut self, x: usize, y: usize) -> bool {
-    pub fn get(&self, x: usize, y: usize) -> CellState {
-    pub fn owner(&self, x: usize, y: usize) -> Option<&str> {
-    pub fn allocate_block(&mut self, w: usize, h: usize, owner: &str) -> Option<(usize, usize)> {
-    pub fn fragmentation(&self) -> f64 {
+### `CellState`
+
+```rust
+pub enum CellState {
+    Leased = 1,    // Actively in use
+    Reserved = 0,  // Claimed but not active
+    Free = -1,     // Available
+}
 ```
 
-## Design Philosophy
+### `LeaseGrid`
 
-This crate uses **ternary algebra** (Z₃) where every value is {-1, 0, +1}:
+- `new(width: usize, height: usize) -> Self` — create empty grid
+- `lease(x, y, owner) -> bool` — lease a single cell
+- `reserve(x, y, owner) -> bool` — reserve a single cell
+- `release(x, y) -> bool` — free a cell regardless of state
+- `get(x, y) -> CellState` — query cell state (out of bounds = `Leased`)
+- `owner(x, y) -> Option<&str>` — query cell owner
+- `allocate_block(w, h, owner) -> Option<(usize, usize)>` — first-fit block allocation, returns top-left corner
+- `fragmentation() -> f64` — 0.0 = unfragmented, →1.0 = scattered free cells
+- `utilization() -> f64` — ratio of leased cells to total
+- `leased_count() -> usize` / `reserved_count() -> usize` / `free_count() -> usize`
+- `width() -> usize` / `height() -> usize`
 
-- **+1** → positive signal (healthy, allocated, converged, ready)
-- **0** → neutral (pending, balanced, monitoring, degraded)
-- **-1** → negative signal (failed, free, diverged, overloaded)
+## The Deeper Idea
 
-This isn't arbitrary — ternary is the natural encoding for:
-1. **BitNet b1.58** (Microsoft) — ternary neural networks at 60% less power
-2. **GPU warp voting** — hardware ballot instructions return ternary consensus
-3. **Conservation laws** — {-1, 0, +1} preserves quantity (what goes in must come out)
+This is the **spatial allocation layer** in the oxide stack's resource management architecture. While oxide-tenancy handles *how much* resource each tenant gets (scalar allocation), oxide-lease-grid handles *where* those resources are (spatial allocation). The grid model maps naturally to real GPU topologies: rows can represent SMs, columns can represent time slices or memory banks.
 
-## Testing
+The ternary cell lifecycle (Free → Reserved → Leased → Free) mirrors the three-phase pattern in hardware resource management. A kernel is compiled (Reserved), dispatched (Leased), and completed (released back to Free). The fragmentation metric tells you when the grid needs compaction — a high fragmentation score means small free regions are scattered between large leased blocks, and you should consider defragmentation before the next large allocation request.
 
-```bash
-git clone https://github.com/SuperInstance/oxide-lease-grid.git
-cd oxide-lease-grid
-cargo test
-```
+## Related Crates
 
-## License
-
-Apache-2.0
+- **oxide-tenancy** — scalar resource allocation that determines *how much* grid space each tenant needs
+- **oxide-federation** — cross-cluster federation that routes work to nodes with available grid space
+- **oxide-capacity** — capacity planning informed by grid utilization
+- **oxide-checkpoint** — saves grid state for recovery after failures
